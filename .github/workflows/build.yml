@@ -1,0 +1,423 @@
+name: Build Island APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_0'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.island"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.island"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies { implementation("androidx.core:core-ktx:1.13.1") }
+          EOF_0
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_1'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application android:label="Island" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service android:name=".IslandService" android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="overlay_island" />
+                  </service>
+
+                  <!-- Нужен, чтобы читать текущий плеер (название, обложка, управление) -->
+                  <service android:name=".MediaListener" android:exported="true"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF_1
+          mkdir -p app/src/main/java/com/example/island
+          cat > app/src/main/java/com/example/island/IslandService.kt <<'EOF_2'
+          package com.example.island
+
+          import android.animation.ValueAnimator
+          import android.app.*
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.media.MediaMetadata
+          import android.media.session.MediaController
+          import android.media.session.MediaSessionManager
+          import android.media.session.PlaybackState
+          import android.os.BatteryManager
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.Settings
+          import android.text.TextUtils
+          import android.view.*
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+          import android.view.animation.DecelerateInterpolator
+          import android.view.animation.OvershootInterpolator
+          import android.widget.*
+          import androidx.core.animation.doOnEnd
+          import androidx.core.app.ServiceCompat
+          import java.text.SimpleDateFormat
+          import java.util.*
+
+          class IslandService : Service() {
+
+              private lateinit var wm: WindowManager
+              private lateinit var lp: WindowManager.LayoutParams
+              private lateinit var root: FrameLayout
+              private lateinit var card: FrameLayout
+              private lateinit var bg: GradientDrawable
+              private lateinit var small: TextView
+              private lateinit var big: LinearLayout
+              private lateinit var art: ImageView
+              private lateinit var title: TextView
+              private lateinit var artist: TextView
+              private lateinit var playBtn: TextView
+
+              private var expanded = false
+              private var controller: MediaController? = null
+              private var torchOn = false
+              private val ui = Handler(Looper.getMainLooper())
+              private val tick = object : Runnable {
+                  override fun run() { refreshSmall(); ui.postDelayed(this, 15_000) }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun dpf(v: Int) = dp(v).toFloat()
+
+              // ---------- lifecycle ----------
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("island", "Island", NotificationManager.IMPORTANCE_MIN))
+                  val n = Notification.Builder(this, "island")
+                      .setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle("Island работает").build()
+                  ServiceCompat.startForeground(this, 1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  buildUi()
+                  lp = WindowManager.LayoutParams(
+                      WRAP_CONTENT, WRAP_CONTENT, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                          WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = dp(8) }
+                  wm.addView(root, lp)
+                  attachMedia()
+                  ui.post(tick)
+              }
+
+              override fun onDestroy() {
+                  ui.removeCallbacksAndMessages(null)
+                  controller?.unregisterCallback(cb)
+                  try { getSystemService(MediaSessionManager::class.java).removeOnActiveSessionsChangedListener(sessionsListener) } catch (_: Exception) {}
+                  if (::root.isInitialized) wm.removeView(root)
+                  super.onDestroy()
+              }
+
+              // ---------- UI ----------
+              private fun text(size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+                  textSize = size; setTextColor(color); maxLines = 1; ellipsize = TextUtils.TruncateAt.END
+                  if (bold) typeface = Typeface.DEFAULT_BOLD
+              }
+
+              private fun buildUi() {
+                  bg = GradientDrawable().apply { setColor(Color.BLACK); cornerRadius = dpf(17) }
+                  card = FrameLayout(this).apply {
+                      background = bg; clipToOutline = true; elevation = dpf(8)
+                      setOnClickListener { if (!expanded) expand() }
+                  }
+                  small = text(13f, Color.WHITE).apply { gravity = Gravity.CENTER; setPadding(dp(12), 0, dp(12), 0) }
+                  card.addView(small, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+                  big = buildBig().apply { visibility = View.GONE }
+                  card.addView(big, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
+                  root = FrameLayout(this)
+                  root.addView(card, FrameLayout.LayoutParams(dp(130), dp(34)))
+                  root.setOnTouchListener { _, e ->
+                      if (e.action == MotionEvent.ACTION_OUTSIDE && expanded) collapse(); false
+                  }
+              }
+
+              private fun buildBig(): LinearLayout {
+                  val c = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(16), dp(16), dp(14)) }
+
+                  // плеер: обложка + названия
+                  art = ImageView(this).apply {
+                      scaleType = ImageView.ScaleType.CENTER_CROP; setBackgroundColor(0xFF2C2C2E.toInt())
+                      outlineProvider = object : ViewOutlineProvider() {
+                          override fun getOutline(v: View, o: Outline) { o.setRoundRect(0, 0, v.width, v.height, dpf(12)) }
+                      }
+                      clipToOutline = true
+                  }
+                  title = text(16f, Color.WHITE, true).apply { text = "Ничего не играет" }
+                  artist = text(13f, 0xFF9A9AA0.toInt())
+                  val names = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_VERTICAL
+                      addView(title); addView(artist)
+                  }
+                  val top = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      addView(art, LinearLayout.LayoutParams(dp(64), dp(64)))
+                      addView(names, LinearLayout.LayoutParams(0, dp(64), 1f).apply { leftMargin = dp(12) })
+                  }
+                  c.addView(top)
+
+                  // кнопки плеера
+                  fun ctl(s: String, a: () -> Unit) = text(26f, Color.WHITE).apply {
+                      text = s; gravity = Gravity.CENTER; setOnClickListener { a() }
+                  }
+                  playBtn = ctl("▶") { controller?.let { if (it.playbackState?.state == PlaybackState.STATE_PLAYING) it.transportControls.pause() else it.transportControls.play() } }
+                  val row = LinearLayout(this).apply {
+                      addView(ctl("⏮") { controller?.transportControls?.skipToPrevious() }, LinearLayout.LayoutParams(0, dp(44), 1f))
+                      addView(playBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
+                      addView(ctl("⏭") { controller?.transportControls?.skipToNext() }, LinearLayout.LayoutParams(0, dp(44), 1f))
+                  }
+                  c.addView(row)
+
+                  // громкость
+                  val am = getSystemService(AudioManager::class.java)
+                  c.addView(SeekBar(this).apply {
+                      max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                      progress = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { if (u) am.setStreamVolume(AudioManager.STREAM_MUSIC, p, 0) }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  })
+
+                  // быстрые плитки
+                  fun tile(label: String, a: () -> Unit) = text(12f, Color.WHITE).apply {
+                      text = label; gravity = Gravity.CENTER; setOnClickListener { a() }
+                      background = GradientDrawable().apply { setColor(0xFF1C1C1E.toInt()); cornerRadius = dpf(14) }
+                  }
+                  val tiles = LinearLayout(this).apply {
+                      fun add(v: View) = addView(v, LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(3), 0, dp(3), 0) })
+                      add(tile("🔦 Фонарь") { toggleTorch() })
+                      add(tile("📶 Wi‑Fi") { open(Settings.Panel.ACTION_INTERNET_CONNECTIVITY) })
+                      add(tile("🔵 BT") { open(Settings.ACTION_BLUETOOTH_SETTINGS) })
+                      add(tile("🔔 Звук") { open(Settings.ACTION_SOUND_SETTINGS) })
+                  }
+                  c.addView(tiles, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8) })
+                  return c
+              }
+
+              private fun open(action: String) {
+                  collapse()
+                  startActivity(Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+              }
+
+              private fun toggleTorch() {
+                  try {
+                      val cm = getSystemService(CameraManager::class.java)
+                      val id = cm.cameraIdList.first { cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true }
+                      torchOn = !torchOn; cm.setTorchMode(id, torchOn)
+                  } catch (_: Exception) {}
+              }
+
+              // ---------- анимация «острова» ----------
+              private fun expand() {
+                  expanded = true
+                  val w = minOf(resources.displayMetrics.widthPixels - dp(24), dp(380))
+                  big.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.UNSPECIFIED)
+                  animateTo(w, big.measuredHeight, dpf(32), true)
+              }
+
+              private fun collapse() {
+                  if (!expanded) return
+                  expanded = false
+                  animateTo(collapsedWidth(), dp(34), dpf(17), false)
+              }
+
+              private fun collapsedWidth() = if (isPlaying()) dp(190) else dp(130)
+
+              private fun animateTo(w: Int, h: Int, radius: Float, show: Boolean) {
+                  val p = card.layoutParams
+                  val w0 = p.width; val h0 = p.height; val r0 = bg.cornerRadius
+                  if (show) { big.visibility = View.VISIBLE; big.alpha = 0f }
+                  ValueAnimator.ofFloat(0f, 1f).apply {
+                      duration = if (show) 420 else 260
+                      interpolator = if (show) OvershootInterpolator(0.9f) else DecelerateInterpolator()
+                      addUpdateListener {
+                          val t = it.animatedValue as Float
+                          p.width = (w0 + (w - w0) * t).toInt(); p.height = (h0 + (h - h0) * t).toInt()
+                          bg.cornerRadius = r0 + (radius - r0) * t.coerceIn(0f, 1f)
+                          val f = it.animatedFraction
+                          big.alpha = if (show) f else 1 - f
+                          small.alpha = if (show) 1 - f else f
+                          card.layoutParams = p
+                      }
+                      doOnEnd { if (!show) big.visibility = View.GONE }
+                  }.start()
+              }
+
+              // ---------- медиа ----------
+              private val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener { pick(it) }
+              private val cb = object : MediaController.Callback() {
+                  override fun onMetadataChanged(m: MediaMetadata?) = refreshMedia()
+                  override fun onPlaybackStateChanged(s: PlaybackState?) = refreshMedia()
+              }
+
+              private fun attachMedia() {
+                  try {
+                      val msm = getSystemService(MediaSessionManager::class.java)
+                      val cn = ComponentName(this, MediaListener::class.java)
+                      msm.addOnActiveSessionsChangedListener(sessionsListener, cn)
+                      pick(msm.getActiveSessions(cn))
+                  } catch (_: SecurityException) { /* нет доступа к уведомлениям */ }
+              }
+
+              private fun pick(list: List<MediaController>?) {
+                  controller?.unregisterCallback(cb)
+                  controller = list?.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING } ?: list?.firstOrNull()
+                  controller?.registerCallback(cb)
+                  refreshMedia()
+              }
+
+              private fun isPlaying() = controller?.playbackState?.state == PlaybackState.STATE_PLAYING
+
+              private fun refreshMedia() {
+                  val m = controller?.metadata
+                  title.text = m?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Ничего не играет"
+                  artist.text = m?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
+                  val bmp = m?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: m?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                  art.setImageBitmap(bmp)
+                  playBtn.text = if (isPlaying()) "⏸" else "▶"
+                  if (!expanded) card.layoutParams = card.layoutParams.also { it.width = collapsedWidth() }
+                  refreshSmall()
+              }
+
+              private fun refreshSmall() {
+                  small.text = if (isPlaying()) "♪ ${title.text}" else {
+                      val bat = getSystemService(BatteryManager::class.java).getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                      "${SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())} · $bat%"
+                  }
+              }
+          }
+          EOF_2
+          mkdir -p app/src/main/java/com/example/island
+          cat > app/src/main/java/com/example/island/MainActivity.kt <<'EOF_3'
+          package com.example.island
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(pad, pad, pad, pad)
+                  }
+                  fun btn(t: String, a: () -> Unit) = Button(this).apply { text = t; setOnClickListener { a() } }
+                  col.addView(TextView(this).apply { text = "Island для Android"; textSize = 22f; gravity = Gravity.CENTER })
+                  col.addView(btn("1. Разрешить поверх других окон") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  })
+                  col.addView(btn("2. Доступ к уведомлениям (для плеера)") {
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                  })
+                  col.addView(btn("3. Запустить остров") {
+                      if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                      if (Settings.canDrawOverlays(this)) startForegroundService(Intent(this, IslandService::class.java))
+                  })
+                  col.addView(btn("Остановить") { stopService(Intent(this, IslandService::class.java)) })
+                  setContentView(col)
+              }
+          }
+          EOF_3
+          mkdir -p app/src/main/java/com/example/island
+          cat > app/src/main/java/com/example/island/MediaListener.kt <<'EOF_4'
+          package com.example.island
+
+          import android.service.notification.NotificationListenerService
+
+          /** Пустой сервис: сам факт выданного доступа к уведомлениям даёт право читать медиасессии. */
+          class MediaListener : NotificationListenerService()
+          EOF_4
+          cat > build.gradle.kts <<'EOF_5'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_5
+          cat > gradle.properties <<'EOF_6'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF_6
+          cat > settings.gradle.kts <<'EOF_7'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Island"
+          include(":app")
+          EOF_7
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Island-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
